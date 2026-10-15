@@ -20,3 +20,6 @@ coverage.out
 # Local credentials, deployment backups, and verification artifacts
 .local/
 *.availability.json
+
+# Hardened local builds
+opencode2api-harden*.exe
