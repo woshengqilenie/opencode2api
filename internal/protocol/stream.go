@@ -274,7 +274,10 @@ func nextSSEBoundary(data []byte) (int, int) {
 
 func readSSE(reader io.Reader, handler func(eventName, data string) error) error {
 	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 64<<10), 16<<20)
+	// A single oversized line must fail loudly instead of killing the stream
+	// silently; the ceiling matches the hardened relays' 32 MiB budget so a
+	// large tool-call argument line survives.
+	scanner.Buffer(make([]byte, 64<<10), 32<<20)
 	var eventName string
 	var dataLines []string
 	flush := func() error {

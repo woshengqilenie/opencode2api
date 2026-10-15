@@ -94,6 +94,7 @@ func NewRuntimeManager(root context.Context, configPath string, cfg config.Confi
 		return nil, err
 	}
 	manager.rotation = rotationManager
+	manager.startRotationFlush(root)
 	runtime, err := manager.build(cfg)
 	if err != nil {
 		return nil, err
@@ -283,9 +284,35 @@ func (m *RuntimeManager) Shutdown() {
 	if m.availabilityCancel != nil {
 		m.availabilityCancel()
 	}
+	if m.rotation != nil {
+		m.rotation.Flush()
+	}
 	if current := m.current.Load(); current != nil {
 		current.cancel()
 	}
+}
+
+// startRotationFlush batches rotation-state writes: hot-path mutations only
+// mark the state dirty, and this loop persists them every couple of seconds
+// (plus once on shutdown). Without it every attempt sat on a marshal + fsync +
+// rename before it could be logged.
+func (m *RuntimeManager) startRotationFlush(ctx context.Context) {
+	if m.rotation == nil {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				m.rotation.Flush()
+				return
+			case <-ticker.C:
+				m.rotation.Flush()
+			}
+		}
+	}()
 }
 
 type ResourceSnapshot struct {

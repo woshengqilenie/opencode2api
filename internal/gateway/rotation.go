@@ -110,8 +110,8 @@ func (g *Gateway) handleRotation(w http.ResponseWriter, r *http.Request, externa
 				}
 			}
 			g.rotation.Record(rotation.Attempt{Request: ids.Request, Alias: alias, Model: token.Model, Number: total, Outcome: outcome})
-			if state := g.rotation.Snapshot(); state.PersistenceError != "" {
-				g.logger.Error("rotation state persistence failed", "component", "rotation", "event", "rotation_persistence_failed")
+			if message := g.rotation.PersistenceError(); message != "" {
+				g.logger.Error("rotation state persistence failed", "component", "rotation", "event", "rotation_persistence_failed", "message", message)
 			}
 			g.logger.Info("model rotation attempt", "component", "rotation", "event", "rotation_attempt", "request_id", ids.Request, "alias", alias, "model", token.Model, "attempt", total, "reason", outcome)
 			if canceled {
@@ -210,7 +210,7 @@ func (g *Gateway) rotationAttempt(parent context.Context, w http.ResponseWriter,
 	setRequestCredential(parent, config.TierGo, config.KeyDisplayID(node.key), "key", false, proxy)
 	started := time.Now()
 	resp, err := client.Do(req)
-	g.recordUpstreamAttempt(parent, route, ids, attempt, config.KeyDisplayID(node.key), "key", false, proxy, resp, err, time.Since(started))
+	g.recordUpstreamAttempt(parent, route, ids, attempt, config.KeyDisplayID(node.key), "key", false, proxy, resp, err, time.Since(started), "")
 	if resp != nil {
 		defer resp.Body.Close()
 	}

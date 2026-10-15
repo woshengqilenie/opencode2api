@@ -53,6 +53,9 @@ type Manager struct {
 	path  string
 	state Snapshot
 	cfg   config.RotationConfig
+	// dirty marks state changes that have not reached disk yet. Hot-path
+	// mutations (one per attempt) only set it; a periodic Flush writes once.
+	dirty bool
 }
 
 func New(path string, cfg config.RotationConfig) (*Manager, error) {
@@ -196,7 +199,7 @@ func (m *Manager) Select(id string, visited map[string]bool) (Token, bool) {
 		// A request-local skip must not change a newer, healthy global selection.
 		if !usable(g, g.Current) {
 			m.switchLocked(g, model, "当前模型暂停或已下架")
-			m.saveLocked()
+			m.markDirtyLocked()
 		}
 		return Token{g.ID, model, g.Generation}, true
 	}
@@ -234,7 +237,7 @@ func (m *Manager) Fail(t Token, pause time.Duration, reason string) {
 		}
 		m.switchLocked(g, next, reason)
 	}
-	m.saveLocked()
+	m.markDirtyLocked()
 }
 func (m *Manager) Manual(id, model string) error {
 	m.mu.Lock()
@@ -259,7 +262,47 @@ func (m *Manager) Record(a Attempt) {
 	if len(m.state.Attempts) > 100 {
 		m.state.Attempts = m.state.Attempts[len(m.state.Attempts)-100:]
 	}
-	m.saveLocked()
+	m.markDirtyLocked()
+}
+
+// markDirtyLocked defers the write to the next Flush. Every attempt used to
+// marshal, fsync, and rename the whole state on its own; under load that put a
+// disk sync on the request path.
+func (m *Manager) markDirtyLocked() {
+	m.dirty = true
+}
+
+// Flush persists pending state changes. It is driven by the runtime manager on
+// a short interval and again on shutdown, so at most a few seconds of attempt
+// history can be lost to a crash while hot paths stay memory-only.
+func (m *Manager) Flush() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.dirty || m.path == "" {
+		return
+	}
+	m.state.PersistenceError = ""
+	if err := m.writeLocked(); err != nil {
+		// Keep the dirty flag so the next tick retries; the admin surface
+		// reports the failure through PersistenceError.
+		m.state.PersistenceError = "轮转状态写入失败，请检查磁盘空间和文件权限"
+		return
+	}
+	m.dirty = false
+}
+
+// PersistenceError reports the last background write failure without
+// serializing the whole snapshot, which the per-attempt request log used to do.
+func (m *Manager) PersistenceError() string {
+	if m == nil {
+		return ""
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.state.PersistenceError
 }
 func (m *Manager) saveLocked() {
 	if m.path == "" {

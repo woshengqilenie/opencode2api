@@ -29,6 +29,7 @@ type Config struct {
 	Retry             RetryConfig                  `json:"retry"`
 	Models            ModelsConfig                 `json:"models"`
 	Performance       PerformanceConfig            `json:"performance"`
+	Hardening         HardeningConfig              `json:"hardening"`
 	Logging           LoggingConfig                `json:"logging"`
 	WebUI             WebUIConfig                  `json:"webui"`
 	Prefer            Tier                         `json:"prefer"`
@@ -71,6 +72,21 @@ type ModelsConfig struct {
 	// FreeOnly limits discovery and routing to free models, even when Zen or
 	// Go keys could serve paid ones. Free models may still fall back to keys.
 	FreeOnly bool `json:"free_only"`
+	// Limits overrides the context and output budgets reported for a model.
+	// The upstream capability catalog is deliberately conservative for some
+	// free models (a free DeepSeek advertises 200k while the lane accepts
+	// 2^20 tokens), and every client that plans its context from /v1/models
+	// inherits the wrong number. An override changes what the gateway
+	// reports; it does not touch what upstream enforces.
+	Limits map[string]ModelLimits `json:"limits,omitempty"`
+}
+
+// ModelLimits is one per-model limit override. A nil field keeps the value
+// the catalog reported; 0 is rejected so an override is always explicit.
+type ModelLimits struct {
+	ContextWindow *int `json:"context_window,omitempty"`
+	MaxInput      *int `json:"max_input,omitempty"`
+	MaxOutput     *int `json:"max_output,omitempty"`
 }
 
 type LoggingConfig struct {
@@ -100,6 +116,41 @@ type PerformanceConfig struct {
 	FailureCooldownSeconds   int `json:"failure_cooldown_seconds"`
 	AttemptTimeoutSeconds    int `json:"attempt_timeout_seconds"`
 	FirstEventTimeoutSeconds int `json:"first_event_timeout_seconds"`
+}
+
+// HardeningConfig tunes the stream-reliability layer. Every field accepts 0 to
+// disable that guard; the values below are applied by Load when the operator
+// does not set the block at all.
+type HardeningConfig struct {
+	// HoldFirstEventSeconds caps how long an attempt may wait for the first
+	// content event before it is abandoned and the node is rotated. The wait
+	// only runs while another attempt can still follow, so the final attempt
+	// always falls back to the historical pass-through behavior. A hold that
+	// times out or ends without content cools the node and retries it
+	// invisibly, because nothing has been written to the client yet.
+	HoldFirstEventSeconds int `json:"hold_first_event_seconds"`
+	// IdleEventSeconds aborts an attempt (pre-content) or a committed stream
+	// (post-content) when no upstream bytes arrive for this long. It is the
+	// only guard that can tell a hung exit apart from a slow generation.
+	IdleEventSeconds int `json:"idle_event_seconds"`
+	// KeepAliveSeconds writes a `: keep-alive` SSE comment frame to the
+	// client when no real bytes have gone out for this long, so committed
+	// streams survive long thinking pauses.
+	KeepAliveSeconds int `json:"keepalive_seconds"`
+	// ZeroOutputRetries is how many extra dispatch rounds a non-streaming
+	// response may be replayed when the upstream produced no usable output.
+	ZeroOutputRetries int `json:"zero_output_retries"`
+}
+
+// DefaultHardening returns the hardening values applied when a configuration
+// omits the block. Explicit zeros in a config file override them.
+func DefaultHardening() HardeningConfig {
+	return HardeningConfig{
+		HoldFirstEventSeconds: 120,
+		IdleEventSeconds:      300,
+		KeepAliveSeconds:      10,
+		ZeroOutputRetries:     1,
+	}
 }
 
 // AttemptTimeout bounds how long a single upstream attempt may wait for
@@ -141,6 +192,7 @@ func Load(path string) (Config, error) {
 		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300},
 		Models:      ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
 		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15},
+		Hardening:   DefaultHardening(),
 		Logging:     LoggingConfig{Level: "info", RingSize: 2000},
 		WebUI:       WebUIConfig{Listen: "0.0.0.0:8081", SessionTTLMinutes: 720},
 		Prefer:      TierGo,
@@ -215,6 +267,18 @@ func Normalize(path string, cfg Config) (Config, error) {
 	if cfg.Performance.FirstEventTimeoutSeconds < 0 || cfg.Performance.FirstEventTimeoutSeconds > 86400 {
 		return Config{}, errors.New("performance.first_event_timeout_seconds must be between 0 and 86400 (0 disables the first-event timeout)")
 	}
+	if cfg.Hardening.HoldFirstEventSeconds < 0 || cfg.Hardening.HoldFirstEventSeconds > 86400 {
+		return Config{}, errors.New("hardening.hold_first_event_seconds must be between 0 and 86400 (0 disables the pre-content hold)")
+	}
+	if cfg.Hardening.IdleEventSeconds < 0 || cfg.Hardening.IdleEventSeconds > 86400 {
+		return Config{}, errors.New("hardening.idle_event_seconds must be between 0 and 86400 (0 disables the idle watchdog)")
+	}
+	if cfg.Hardening.KeepAliveSeconds < 0 || cfg.Hardening.KeepAliveSeconds > 3600 {
+		return Config{}, errors.New("hardening.keepalive_seconds must be between 0 and 3600 (0 disables keep-alive frames)")
+	}
+	if cfg.Hardening.ZeroOutputRetries < 0 || cfg.Hardening.ZeroOutputRetries > 5 {
+		return Config{}, errors.New("hardening.zero_output_retries must be between 0 and 5")
+	}
 	if cfg.Logging.Level != "debug" && cfg.Logging.Level != "info" && cfg.Logging.Level != "warn" && cfg.Logging.Level != "error" {
 		return Config{}, errors.New("logging.level must be debug, info, warn, or error")
 	}
@@ -257,6 +321,16 @@ func Normalize(path string, cfg Config) (Config, error) {
 	for model, protocol := range cfg.Models.Protocols {
 		if model == "" || !wire.Valid(wire.Protocol(protocol)) {
 			return Config{}, fmt.Errorf("models.protocols contains invalid mapping %q: %q", model, protocol)
+		}
+	}
+	for model, limits := range cfg.Models.Limits {
+		if strings.TrimSpace(model) == "" {
+			return Config{}, errors.New("models.limits must not contain an empty model ID")
+		}
+		for name, value := range map[string]*int{"context_window": limits.ContextWindow, "max_input": limits.MaxInput, "max_output": limits.MaxOutput} {
+			if value != nil && (*value < 1 || *value > 100_000_000) {
+				return Config{}, fmt.Errorf("models.limits[%q].%s must be between 1 and 100000000", model, name)
+			}
 		}
 	}
 	if err := normalizeReasoning(&cfg); err != nil {
@@ -358,6 +432,13 @@ func Clone(cfg Config) Config {
 			protocols[key] = value
 		}
 		cfg.Models.Protocols = protocols
+	}
+	if cfg.Models.Limits != nil {
+		limits := make(map[string]ModelLimits, len(cfg.Models.Limits))
+		for model, entry := range cfg.Models.Limits {
+			limits[model] = entry
+		}
+		cfg.Models.Limits = limits
 	}
 	if cfg.Reasoning.EffortByModel != nil {
 		efforts := make(map[string]string, len(cfg.Reasoning.EffortByModel))

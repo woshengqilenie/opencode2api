@@ -62,6 +62,7 @@ type Catalog struct {
 	prefer          config.Tier
 	pricing         *PricingStore
 	availability    *AvailabilityStore
+	limits          map[string]config.ModelLimits
 	cachePath       string
 	cacheSource     string
 	stale           bool
@@ -102,6 +103,14 @@ func (c *Catalog) SetPricingStore(store *PricingStore) {
 func (c *Catalog) SetAvailabilityStore(store *AvailabilityStore) {
 	c.mu.Lock()
 	c.availability = store
+	c.mu.Unlock()
+}
+
+// SetLimits installs per-model limit overrides. They win over every other
+// source because the operator stated them explicitly.
+func (c *Catalog) SetLimits(limits map[string]config.ModelLimits) {
+	c.mu.Lock()
+	c.limits = limits
 	c.mu.Unlock()
 }
 
@@ -495,12 +504,15 @@ func (c *Catalog) MetadataForTier(model string, tier config.Tier) Metadata {
 	c.mu.RLock()
 	md := c.modelMeta[tier][model]
 	pricing := c.pricing
+	overrides, hasOverride := c.limits[model]
 	c.mu.RUnlock()
 	if pricing == nil {
+		md = applyLimitOverrides(md, overrides, hasOverride)
 		return md
 	}
 	price, ok := pricing.Price(model)
 	if !ok {
+		md = applyLimitOverrides(md, overrides, hasOverride)
 		return md
 	}
 	// OpenCode's capability catalog is authoritative. Use models.dev limits
@@ -517,6 +529,25 @@ func (c *Catalog) MetadataForTier(model string, tier config.Tier) Metadata {
 	}
 	if price.Input != nil || price.Output != nil {
 		md.Cost = &Cost{Input: price.Input, Output: price.Output, CacheRead: price.CacheRead, CacheWrite: price.CacheWrite}
+	}
+	md = applyLimitOverrides(md, overrides, hasOverride)
+	return md
+}
+
+// applyLimitOverrides applies the operator's models.limits entries last: they
+// state the budget a client should plan with, not what the catalog published.
+func applyLimitOverrides(md Metadata, overrides config.ModelLimits, ok bool) Metadata {
+	if !ok {
+		return md
+	}
+	if overrides.ContextWindow != nil {
+		md.ContextWindow = *overrides.ContextWindow
+	}
+	if overrides.MaxInput != nil {
+		md.MaxInput = *overrides.MaxInput
+	}
+	if overrides.MaxOutput != nil {
+		md.MaxOutput = *overrides.MaxOutput
 	}
 	return md
 }

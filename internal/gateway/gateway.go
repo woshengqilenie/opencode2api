@@ -79,6 +79,7 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*G
 	catalog := models.NewCatalog(cfg.Prefer, cfg.Models.Protocols)
 	catalog.SetRefreshInterval(time.Duration(cfg.Models.RefreshSeconds) * time.Second)
 	catalog.SetFreeOnly(cfg.Models.FreeOnly)
+	catalog.SetLimits(cfg.Models.Limits)
 	return &Gateway{
 		cfg:            cfg,
 		rotation:       rotationManager,
@@ -259,12 +260,20 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			w.Header().Set("Cache-Control", "no-cache")
 			w.Header().Set("X-Accel-Buffering", "no")
 			w.WriteHeader(resp.StatusCode)
+			// Hardening: serialize downstream writes behind a keep-alive
+			// writer so a long thinking pause cannot trip a client read
+			// timeout, and abort the relay when upstream bytes stop arriving
+			// altogether.
+			keeper := newKeepAliveWriter(w, time.Duration(g.cfg.Hardening.KeepAliveSeconds)*time.Second)
+			defer keeper.Stop()
+			watch, body := startIdleWatch(resp.Body, time.Duration(g.cfg.Hardening.IdleEventSeconds)*time.Second)
+			defer watch.Stop()
 			var usage wire.Usage
 			var usageReported bool
 			if external == upstreamRoute.Protocol {
-				usage, usageReported, err = wire.ForwardStream(r.Context(), w, resp.Body, upstreamRoute.Protocol, model)
+				usage, usageReported, err = wire.ForwardStream(r.Context(), keeper, body, upstreamRoute.Protocol, model)
 			} else {
-				usage, usageReported, err = wire.TranscodeStream(r.Context(), w, resp.Body, upstreamRoute.Protocol, external, model)
+				usage, usageReported, err = wire.TranscodeStream(r.Context(), keeper, body, upstreamRoute.Protocol, external, model)
 			}
 			if meta != nil {
 				meta.Usage, meta.UsageReported = usage, usageReported
@@ -273,31 +282,48 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 					if wire.ClientCanceled(r.Context(), err) {
 						meta.Outcome = "client_canceled"
 					}
+					if watch.Fired() {
+						meta.Outcome = "idle_timeout"
+					}
 				}
 			}
-			if err != nil && !errors.Is(err, context.Canceled) {
+			if err != nil && watch.Fired() {
+				g.logger.Warn("downstream stream aborted by the idle watchdog", "component", "stream", "event", "stream_idle_timeout", "request_id", ids.Request, "model", model, "tier", upstreamRoute.Tier, "error", err)
+			} else if err != nil && !errors.Is(err, context.Canceled) {
 				g.logger.Warn("downstream stream ended with an error", "component", "stream", "event", "stream_failed", "request_id", ids.Request, "model", model, "tier", upstreamRoute.Tier, "error", err)
 			}
 			return
 		}
-		responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
-		if err != nil {
+		responseBody, readErr, collapseErr := g.readNonStreamBody(resp, upstreamRoute, meta, model, g.catalog.IsFreeModel(upstreamRoute.ID))
+		// Hardening: replay a zero-output document on another node while
+		// nothing has been written downstream yet.
+		for replay := 0; readErr == nil && collapseErr == nil && replay < g.cfg.Hardening.ZeroOutputRetries &&
+			nonStreamZeroOutput(external, responseBody); replay++ {
+			_ = resp.Body.Close()
+			retryResp, retryRoute, retryErr := g.doUpstream(requestCtx, route, bodies, ids)
+			if retryErr != nil || retryResp == nil {
+				if retryResp != nil {
+					_ = retryResp.Body.Close()
+				}
+				break
+			}
+			if retryResp.StatusCode/100 != 2 {
+				_ = retryResp.Body.Close()
+				break
+			}
+			g.logger.Info("replaying a zero-output upstream response", "component", "upstream", "event", "zero_output_replay", "request_id", ids.Request, "model", model, "replay", replay+1)
+			resp, upstreamRoute = retryResp, retryRoute
+			responseBody, readErr, collapseErr = g.readNonStreamBody(resp, upstreamRoute, meta, model, g.catalog.IsFreeModel(upstreamRoute.ID))
+		}
+		_ = resp.Body.Close()
+		if readErr != nil {
 			wire.WriteError(w, external, http.StatusBadGateway, "failed to read upstream response", "upstream_error", ids.Request)
 			return
 		}
-		if upstreamRoute.Anonymous || (meta != nil && meta.Shaped) {
-			// Key-tier shaped requests were force-streamed like the
-			// anonymous lane; collapse the same way.
-			// The anonymous lane is served streaming (see prepareAnonymousBody);
-			// collapse the events back into the single document this
-			// non-streaming client asked for.
-			collapsed, err := wire.CollapseStream(bytes.NewReader(responseBody), upstreamRoute.Protocol, model)
-			if err != nil {
-				g.logger.Warn("anonymous stream collapse failed", "component", "conversion", "event", "anonymous_collapse_failed", "request_id", ids.Request, "model", model, "source_protocol", upstreamRoute.Protocol, "error", err)
-				wire.WriteError(w, external, http.StatusBadGateway, "unsupported upstream response", "upstream_error", ids.Request)
-				return
-			}
-			responseBody = collapsed
+		if collapseErr != nil {
+			g.logger.Warn("anonymous stream collapse failed", "component", "conversion", "event", "anonymous_collapse_failed", "request_id", ids.Request, "model", model, "source_protocol", upstreamRoute.Protocol, "error", collapseErr)
+			wire.WriteError(w, external, http.StatusBadGateway, "unsupported upstream response", "upstream_error", ids.Request)
+			return
 		}
 		if usage, reported := wire.ResponseUsage(upstreamRoute.Protocol, responseBody); meta != nil {
 			meta.Usage, meta.UsageReported = usage, reported
@@ -496,4 +522,103 @@ func copyErrorResponse(w http.ResponseWriter, protocol wire.Protocol, resp *http
 		message = jsonutil.FirstString(jsonutil.StringAt(value, "error", "message"), jsonutil.StringAt(value, "message"), message)
 	}
 	wire.WriteError(w, protocol, resp.StatusCode, message, "upstream_error", requestID)
+}
+
+// readNonStreamBody reads one upstream response for a non-streaming client,
+// collapsing the SSE stream that shaped lanes answer with. Read errors and
+// collapse errors are reported separately so the caller keeps the original
+// status semantics. The shaped flag must not depend on telemetry alone: a free
+// model on a key lane is force-streamed whether or not request metadata exists,
+// so the catalog predicate is passed in as well.
+func (g *Gateway) readNonStreamBody(resp *http.Response, upstreamRoute models.Route, meta *telemetry.RequestMeta, model string, freeModel bool) ([]byte, error, error) {
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	if err != nil {
+		return nil, err, nil
+	}
+	if upstreamRoute.Anonymous || freeModel || (meta != nil && meta.Shaped) {
+		// Key-tier shaped requests were force-streamed like the anonymous
+		// lane; collapse the same way. The anonymous lane is served streaming
+		// (see prepareAnonymousBody); collapse the events back into the single
+		// document this non-streaming client asked for.
+		collapsed, cerr := wire.CollapseStream(bytes.NewReader(responseBody), upstreamRoute.Protocol, model)
+		if cerr != nil {
+			return responseBody, nil, cerr
+		}
+		responseBody = collapsed
+	}
+	return responseBody, nil, nil
+}
+
+// nonStreamZeroOutput reports whether a completed response carries no usable
+// output for the protocol it is written in. It never guesses: unknown shapes
+// are treated as non-empty so a replay cannot loop on a document the gateway
+// does not understand.
+func nonStreamZeroOutput(protocol wire.Protocol, body []byte) bool {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return true
+	}
+	var document map[string]any
+	if err := json.Unmarshal(body, &document); err != nil {
+		return false
+	}
+	switch protocol {
+	case wire.Chat:
+		choices, _ := document["choices"].([]any)
+		if len(choices) == 0 {
+			return true
+		}
+		for _, raw := range choices {
+			choice, _ := raw.(map[string]any)
+			message, _ := choice["message"].(map[string]any)
+			if message == nil {
+				continue
+			}
+			if jsonutil.StringAt(message, "content") != "" || jsonutil.StringAt(message, "reasoning_content") != "" {
+				return false
+			}
+			if calls, ok := message["tool_calls"].([]any); ok && len(calls) > 0 {
+				return false
+			}
+		}
+		return true
+	case wire.Anthropic:
+		blocks, _ := document["content"].([]any)
+		for _, raw := range blocks {
+			block, _ := raw.(map[string]any)
+			switch jsonutil.StringAt(block, "type") {
+			case "text":
+				if jsonutil.StringAt(block, "text") != "" {
+					return false
+				}
+			case "thinking":
+				if jsonutil.StringAt(block, "thinking") != "" {
+					return false
+				}
+			case "tool_use":
+				if input, ok := block["input"].(map[string]any); ok && len(input) > 0 {
+					return false
+				}
+			}
+		}
+		return true
+	case wire.Responses:
+		output, _ := document["output"].([]any)
+		for _, raw := range output {
+			item, _ := raw.(map[string]any)
+			switch jsonutil.StringAt(item, "type") {
+			case "function_call", "reasoning":
+				return false
+			case "message":
+				parts, _ := item["content"].([]any)
+				for _, rawPart := range parts {
+					part, _ := rawPart.(map[string]any)
+					if jsonutil.StringAt(part, "text") != "" {
+						return false
+					}
+				}
+			}
+		}
+		return true
+	}
+	return false
 }

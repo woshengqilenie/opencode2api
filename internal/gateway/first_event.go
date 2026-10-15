@@ -83,6 +83,14 @@ func classifyAttemptError(err error) string {
 		return "attempt_timeout" + phase
 	case errors.Is(err, errFirstEventTimeout):
 		return "first_event"
+	case errors.Is(err, errHoldNoContent):
+		return "empty_stream"
+	case errors.Is(err, errHoldSSEError):
+		return "sse_error"
+	case errors.Is(err, errHoldTimeout):
+		return "hold_timeout"
+	case errors.Is(err, errHoldIdle):
+		return "idle"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "timeout" + phase
 	default:

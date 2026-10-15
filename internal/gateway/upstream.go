@@ -84,7 +84,16 @@ func (g *Gateway) doUpstream(ctx context.Context, route models.Route, bodies map
 		redactor.Replace(g.cfg)
 		snippet := redactor.String(string(errBody))
 		if len(snippet) > 240 {
-			snippet = snippet[:240]
+			// Truncate on a rune boundary: a byte slice would split a
+			// multi-byte character and put invalid UTF-8 into the log.
+			cut := 0
+			for index := range snippet {
+				if index > 240 {
+					break
+				}
+				cut = index
+			}
+			snippet = snippet[:cut]
 		}
 		g.logger.Info("upstream error returned or retried", "component", "upstream", "event", "upstream_error_body", "request_id", ids.Request, "model", route.ID, "status", resp.StatusCode, "snippet", snippet)
 	}
@@ -202,7 +211,7 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 		return resp, route, used, err
 	}
 	if route.Anonymous {
-		resp, err, used := g.doAnonymousUpstream(ctx, route, bodies, ids, attempts)
+		resp, err, used := g.doAnonymousUpstream(ctx, route, bodies, ids, attempts, len(route.KeyTiers) > 0)
 		attempts += used
 		if err == nil && resp != nil && resp.StatusCode/100 == 2 {
 			return resp, route, attempts, nil
@@ -229,7 +238,7 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 	if !route.Anonymous && len(keyTiers) == 0 && (route.Tier == config.TierZen || route.Tier == config.TierGo) {
 		keyTiers = []config.Tier{route.Tier}
 	}
-	for _, tier := range keyTiers {
+	for tierIndex, tier := range keyTiers {
 		if lastResponse != nil {
 			httpx.DrainAndClose(lastResponse.Body)
 			lastResponse = nil
@@ -239,7 +248,7 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 		keyRoute.Anonymous = false
 		keyRoute.Protocol = route.ProtocolFor(tier)
 		effectiveRoute = keyRoute
-		resp, err, used := g.doKeyUpstream(ctx, keyRoute, bodies, ids, attempts)
+		resp, err, used := g.doKeyUpstream(ctx, keyRoute, bodies, ids, attempts, tierIndex < len(keyTiers)-1)
 		attempts += used
 		if err == nil && resp != nil && resp.StatusCode/100 == 2 {
 			return resp, keyRoute, attempts, nil
@@ -259,7 +268,7 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 // failure, including an HTTP error response, advances to the next proxy. Only a
 // successful response ends the anonymous phase; exhausting the proxy cursor
 // returns control to the preferred authenticated tiers.
-func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) (*http.Response, error, int) {
+func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int, followUp bool) (*http.Response, error, int) {
 	var lastResponse *http.Response
 	var lastErr error
 	cursor := g.anonymous.CursorFor(ids.Session)
@@ -317,11 +326,25 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			break
 		}
 		g.observeAnonymousResult(ctx, node, resp, err)
-		g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, "anonymous", "anonymous", true, node.proxy, resp, err, duration)
+		// Hardening: while another attempt can still follow, hold the stream
+		// open until it produces content. A stream that dies, errors, or
+		// stays silent before its first content event is treated as a failed
+		// attempt, so the cursor can move on before the client ever sees a
+		// frame. Nothing is written downstream during the hold.
 		if err == nil && resp.StatusCode/100 == 2 {
+			if outcome, held := g.holdIfStream(resp, route.Protocol, followUp || attempts < limit); held {
+				httpx.DrainAndClose(resp.Body)
+				g.anonymous.MarkFailure(node, nil, outcome.err)
+				g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, "anonymous", "anonymous", true, node.proxy, nil, outcome.err, duration, "empty_stream")
+				g.logger.Debug("anonymous attempt produced no content before the hold ended; rotating", "component", "upstream", "event", "anonymous_attempt_empty", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "proxy", config.RedactURL(node.proxy.name), "error", outcome.err)
+				lastResponse, lastErr = nil, outcome.err
+				continue
+			}
+			g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, "anonymous", "anonymous", true, node.proxy, resp, err, duration, "")
 			g.logger.Debug("anonymous upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
 			return resp, nil, attempts
 		}
+		g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, "anonymous", "anonymous", true, node.proxy, resp, err, duration, "")
 		lastResponse = resp
 		lastErr = err
 		if err != nil {
@@ -652,14 +675,14 @@ func (g *Gateway) doSelectedKeyUpstream(ctx context.Context, route models.Route,
 	started := time.Now()
 	resp, err := doInferenceAttempt(proxy.client, req, time.Duration(g.cfg.Performance.FirstEventTimeoutSeconds)*time.Second, g.attemptTimeout)
 	duration := time.Since(started)
-	g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+1, keyID, "key", false, proxy, resp, err, duration)
+	g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+1, keyID, "key", false, proxy, resp, err, duration, "")
 	if err != nil {
 		return nil, err, 1
 	}
 	return resp, nil, 1
 }
 
-func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) (*http.Response, error, int) {
+func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int, followUp bool) (*http.Response, error, int) {
 	var lastResponse *http.Response
 	var lastErr error
 	nodes := g.zenNodes
@@ -683,6 +706,9 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 			meta.Shaped = true
 		}
 	}
+	// authRejected tracks keys that answered 401/403 so a single-key pool
+	// stops re-trying the same credential within one request.
+	authRejected := map[int]bool{}
 	for attempts < g.cfg.Retry.MaxAttempts {
 		if ctx.Err() != nil {
 			// Same guard as the anonymous loop: an exhausted request budget
@@ -733,11 +759,23 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 			break
 		}
 		g.observeKeyResult(ctx, nodes, node, proxy, resp, err)
-		g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, keyID, "key", false, proxy, resp, err, attemptDuration)
+		// Hardening: hold the stream until it produces content, as long as a
+		// later attempt exists to absorb a retry. A hold failure cools this
+		// node and rotates, so the client never sees the empty attempt.
 		if err == nil && resp.StatusCode/100 == 2 {
+			if outcome, held := g.holdIfStream(resp, route.Protocol, followUp || attempts < g.cfg.Retry.MaxAttempts); held {
+				httpx.DrainAndClose(resp.Body)
+				nodes.MarkFailure(node, nil, outcome.err)
+				g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, keyID, "key", false, proxy, nil, outcome.err, attemptDuration, "empty_stream")
+				g.logger.Debug("upstream attempt produced no content before the hold ended; rotating", "component", "upstream", "event", "attempt_empty", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "proxy", config.RedactURL(proxy.name), "error", outcome.err)
+				lastResponse, lastErr = nil, outcome.err
+				continue
+			}
+			g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, keyID, "key", false, proxy, resp, err, attemptDuration, "")
 			g.logger.Debug("upstream accepted request", "component", "upstream", "event", "attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "proxy", config.RedactURL(proxy.name), "status", resp.StatusCode, "duration_ms", attemptDuration.Milliseconds())
 			return resp, nil, attempts
 		}
+		g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, keyID, "key", false, proxy, resp, err, attemptDuration, "")
 		// Request-shape errors are deterministic and must leave this tier without
 		// rotating through unrelated keys. The outer route may still try the next
 		// tier in prefer order. Authentication, throttling, server, and transport
@@ -745,6 +783,16 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 		if isNonRetryableClientResponse(resp, err) {
 			g.logger.Debug("upstream rejected a non-retryable request", "component", "upstream", "event", "attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "status", resp.StatusCode, "proxy", config.RedactURL(proxy.name), "duration_ms", attemptDuration.Milliseconds())
 			return resp, nil, attempts
+		}
+		// A key that just rejected this request's credentials keeps rejecting
+		// them, so one round through the pool is enough: without this a
+		// single-key pool burns the whole retry budget on the same 401/403.
+		if err == nil && resp != nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+			authRejected[node.index] = true
+			if len(authRejected) >= nodes.Len() {
+				g.logger.Debug("every upstream key rejected the request; stopping the rotation", "component", "upstream", "event", "attempt_auth_exhausted", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "status", resp.StatusCode)
+				return resp, nil, attempts
+			}
 		}
 		lastResponse = resp
 		lastErr = err
@@ -820,7 +868,7 @@ func requestCredential(ctx context.Context) (string, string, bool) {
 	return meta.KeyID, meta.Channel, meta.Anonymous
 }
 
-func (g *Gateway) recordUpstreamAttempt(ctx context.Context, route models.Route, ids identity.RequestIDs, attempt int, keyID, channel string, anonymous bool, proxy *proxyTransport, resp *http.Response, err error, duration time.Duration) {
+func (g *Gateway) recordUpstreamAttempt(ctx context.Context, route models.Route, ids identity.RequestIDs, attempt int, keyID, channel string, anonymous bool, proxy *proxyTransport, resp *http.Response, err error, duration time.Duration, outcomeOverride string) {
 	status := upstreamStatus(resp)
 	success := err == nil && status >= 200 && status < 300
 	outcome := "retryable_failure"
@@ -830,6 +878,9 @@ func (g *Gateway) recordUpstreamAttempt(ctx context.Context, route models.Route,
 		outcome = "transport_error"
 	} else if isNonRetryableClientResponse(resp, nil) {
 		outcome = "rejected"
+	}
+	if outcomeOverride != "" {
+		outcome = outcomeOverride
 	}
 	if meta := telemetry.MetaFromContext(ctx); meta != nil {
 		meta.AttemptOutcome = outcome

@@ -18,7 +18,8 @@
   "models": {
     "refresh_seconds": 300,
     "protocols": {},
-    "free_only": false
+    "free_only": false,
+    "limits": {}
   },
   "performance": {
     "max_idle_conns": 2048,
@@ -34,6 +35,12 @@
     "level": "info",
     "ring_size": 2000,
     "dump_request_bodies": false
+  },
+  "hardening": {
+    "hold_first_event_seconds": 120,
+    "idle_event_seconds": 300,
+    "keepalive_seconds": 10,
+    "zero_output_retries": 1
   },
   "webui": {
     "enabled": true,
