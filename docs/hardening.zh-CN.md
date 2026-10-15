@@ -58,21 +58,26 @@
 
 ### 7. 模型限额覆盖（models.limits）
 
-上游能力目录对部分免费模型报的上下文偏保守：免费 `deepseek-v4.1-flash-free` 元数据写 200k，而匿名通道实测**接受到 2^20 = 1,048,576 token**（1,048,222 token 的请求 200 且能准确取回文档首尾信息，1,057,000 起被上游 400 拒绝）。客户端按 `/v1/models` 规划上下文，于是跟着错。用 `models.limits` 把网关**对外报的**数字改成实测值：
+上游能力目录对部分免费模型报的上下文/输出偏保守。逐模型把 free 变体与同名原版对比（`config.example.json` 已内置校准表）：
+
+| free 模型 | 目录原值 | 校准为（=原版原生） | 依据 |
+| --- | --- | --- | --- |
+| `deepseek-v4-flash-free` | 200k / 128k | **1000000 / 384000** | 原版 `deepseek-v4-flash` |
+| `deepseek-v4.1-flash-free` | 200k / 32k | **1000000 / 384000** | 原版 `deepseek-v4.1-flash`；**实测** 1,048,222 token 请求通过、`max_tokens=50000` 被接受 |
+| `minimax-m3-free` | 200k / 32k | **512000 / 128000** | 原版 `minimax-m3`；该模型在当前网关因协议不支持未暴露，覆盖值待其可路由后生效 |
+| 其余 free 模型 | — | 不覆盖 | 与同名原版一致，或本就 1M，或没有同名原版 |
 
 ```json
 "models": {
   "limits": {
-    "deepseek-v4.1-flash-free": {
-      "context_window": 1048576,
-      "max_output": 32000
-    }
+    "deepseek-v4.1-flash-free": { "context_window": 1000000, "max_output": 384000 }
   }
 }
 ```
 
 - 语义：覆盖 `MetadataForTier`（即 `/v1/models` 与 WebUI 展示的元数据），在能力目录与 models.dev 之后**最后**应用；`max_input`、`max_output` 同法可覆盖，未写的字段保持原值，`0` 视为非法。
 - 边界：它只改**网关报出去的数字**，不改变上游实际强制的限额；写错只会让客户端规划失真，不会让网关"放行"超限请求。
+- 实测口径（free DeepSeek）：元数据 200k，匿名通道实际接受到 **1,048,222** token（1,057,000 起被上游 400 拒绝，真实闸门 ≈ 2^20）；输出侧 `max_tokens=50000` 被接受，说明 32k 只是声明值。
 - 该字段随 `models` 配置块在 WebUI 的 `PUT /api/config` 往返中保留，但当前没有 WebUI 编辑入口，直接改 `config.json` 即可（保存即热生效）。
 
 ## 可观测性

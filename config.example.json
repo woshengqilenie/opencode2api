@@ -19,7 +19,20 @@
     "refresh_seconds": 300,
     "protocols": {},
     "free_only": false,
-    "limits": {}
+    "limits": {
+      "deepseek-v4-flash-free": {
+        "context_window": 1000000,
+        "max_output": 384000
+      },
+      "deepseek-v4.1-flash-free": {
+        "context_window": 1000000,
+        "max_output": 384000
+      },
+      "minimax-m3-free": {
+        "context_window": 512000,
+        "max_output": 128000
+      }
+    }
   },
   "performance": {
     "max_idle_conns": 2048,
