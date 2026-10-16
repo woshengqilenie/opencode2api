@@ -15,6 +15,13 @@ import (
 // gateway forces stream:true on the wire and collapses the events back so
 // downstream clients that asked for a plain JSON reply keep working.
 func CollapseStream(reader io.Reader, protocol Protocol, model string) ([]byte, error) {
+	return CollapseStreamWithAliases(reader, protocol, model, nil)
+}
+
+// CollapseStreamWithAliases is CollapseStream with a tool alias table so
+// namespaced and custom tool calls collapse back into the item shapes the
+// client declared.
+func CollapseStreamWithAliases(reader io.Reader, protocol Protocol, model string, aliases *ToolAliases) ([]byte, error) {
 	parser := &bridgeStreamParser{
 		protocol:          protocol,
 		tools:             map[string]bool{},
@@ -60,7 +67,7 @@ func CollapseStream(reader io.Reader, protocol Protocol, model string) ([]byte, 
 		}
 		return nil, errSSEUnexpectedEOF
 	}
-	return json.Marshal(encodeBridgeResponse(protocol, acc.response))
+	return json.Marshal(encodeBridgeResponse(protocol, acc.response, aliases))
 }
 
 type collapseAccumulator struct {

@@ -356,7 +356,12 @@ func decodeResponsesToolChoice(value any) bridgeToolChoice {
 	}
 	choice, _ := value.(map[string]any)
 	if jsonutil.StringAt(choice, "type") == "function" {
-		return bridgeToolChoice{Mode: "named", Name: jsonutil.StringAt(choice, "name")}
+		name := jsonutil.StringAt(choice, "name")
+		// A namespaced choice must name the flattened tool the upstream saw.
+		if namespace := jsonutil.StringAt(choice, "namespace"); namespace != "" {
+			name = flattenNamespaceToolName(namespace, name)
+		}
+		return bridgeToolChoice{Mode: "named", Name: name}
 	}
 	return bridgeToolChoice{}
 }

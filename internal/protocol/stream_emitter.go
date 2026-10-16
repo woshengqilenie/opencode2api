@@ -22,6 +22,13 @@ type bridgeStreamTool struct {
 	AnthropicIndex   int
 	Started          bool
 	EmittedArguments int
+	// Custom marks a tool the client declared as free-form ("custom"): its
+	// arguments stream as an input-delta/done pair instead of
+	// function_call_arguments, and the completed item uses the
+	// custom_tool_call type. Namespace carries the namespace of a namespaced
+	// function tool so the emitted item matches what the client declared.
+	Custom    bool
+	Namespace string
 }
 
 type bridgeStreamEmitter struct {
@@ -29,6 +36,7 @@ type bridgeStreamEmitter struct {
 	flush              http.Flusher
 	target             Protocol
 	model              string
+	aliases            *ToolAliases
 	id                 string
 	created            int64
 	started            bool
@@ -59,12 +67,13 @@ type bridgeStreamEmitter struct {
 	responseOutput  []any
 }
 
-func newBridgeStreamEmitter(writer io.Writer, flusher http.Flusher, target Protocol, model string) *bridgeStreamEmitter {
+func newBridgeStreamEmitter(writer io.Writer, flusher http.Flusher, target Protocol, model string, aliases *ToolAliases) *bridgeStreamEmitter {
 	return &bridgeStreamEmitter{
 		w:       writer,
 		flush:   flusher,
 		target:  target,
 		model:   model,
+		aliases: aliases,
 		created: time.Now().Unix(),
 		tools:   map[string]*bridgeStreamTool{},
 	}
@@ -410,6 +419,18 @@ func (emitter *bridgeStreamEmitter) startTool(tool *bridgeStreamTool) error {
 		}
 		emitter.textOpen = false
 	}
+	if emitter.target == Responses {
+		// Restore the item shape the client declared: a namespaced function
+		// keeps its namespace, a custom tool becomes a free-form
+		// custom_tool_call item (Codex uses the "ctc_" id convention).
+		if alias, ok := emitter.aliases.Lookup(tool.Name); ok {
+			tool.Namespace = alias.Namespace
+			if alias.Kind == ToolAliasCustom {
+				tool.Custom = true
+				tool.ItemID = identity.RandomID("ctc", 12)
+			}
+		}
+	}
 	tool.Started = true
 	switch emitter.target {
 	case Chat:
@@ -425,7 +446,7 @@ func (emitter *bridgeStreamEmitter) startTool(tool *bridgeStreamTool) error {
 	case Responses:
 		tool.Index = emitter.nextOutput
 		emitter.nextOutput++
-		item := map[string]any{"id": tool.ItemID, "type": "function_call", "status": "in_progress", "arguments": "", "call_id": tool.ID, "name": tool.Name}
+		item := emitter.responsesToolItem(tool, "in_progress", "")
 		return emitter.sse("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": tool.Index, "item": item, "sequence_number": emitter.nextSequence()})
 	case Anthropic:
 		tool.AnthropicIndex = emitter.nextAnthropic
@@ -449,6 +470,11 @@ func (emitter *bridgeStreamEmitter) emitToolDelta(tool *bridgeStreamTool, delta 
 			"function": map[string]any{"arguments": delta},
 		}}}, nil)
 	case Responses:
+		if tool.Custom {
+			// Free-form input is emitted once at completion; nothing streams
+			// while the arguments accumulate.
+			return nil
+		}
 		return emitter.sse("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "delta": delta, "item_id": tool.ItemID, "output_index": tool.Index, "sequence_number": emitter.nextSequence()})
 	case Anthropic:
 		return emitter.sse("content_block_delta", map[string]any{"type": "content_block_delta", "index": tool.AnthropicIndex, "delta": map[string]any{"type": "input_json_delta", "partial_json": delta}})
@@ -561,7 +587,7 @@ func (emitter *bridgeStreamEmitter) Finish() error {
 			tool := emitter.tools[key]
 			response.Tools = append(response.Tools, bridgeBlock{Kind: "tool_call", ID: tool.ID, Name: tool.Name, ArgumentsJSON: tool.Arguments.String()})
 		}
-		completed := encodeBridgeResponse(Responses, response)
+		completed := encodeBridgeResponse(Responses, response, emitter.aliases)
 		return emitter.sse("response.completed", map[string]any{"type": "response.completed", "response": completed, "sequence_number": emitter.nextSequence()})
 	}
 	return nil
@@ -591,18 +617,67 @@ func (emitter *bridgeStreamEmitter) finishResponsesItems() error {
 		if err := emitter.startTool(tool); err != nil {
 			return err
 		}
+		if tool.Custom {
+			if err := emitter.finishCustomTool(tool, arguments); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := emitter.emitPendingToolArguments(tool); err != nil {
 			return err
 		}
 		if err := emitter.sse("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "arguments": arguments, "item_id": tool.ItemID, "output_index": tool.Index, "sequence_number": emitter.nextSequence()}); err != nil {
 			return err
 		}
-		item := map[string]any{"id": tool.ItemID, "type": "function_call", "status": "completed", "arguments": arguments, "call_id": tool.ID, "name": tool.Name}
+		item := emitter.responsesToolItem(tool, "completed", arguments)
 		if err := emitter.sse("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": tool.Index, "item": item, "sequence_number": emitter.nextSequence()}); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// responsesToolItem renders a function_call or custom_tool_call item for the
+// Responses target, restoring the namespace and the free-form input shape the
+// client declared.
+func (emitter *bridgeStreamEmitter) responsesToolItem(tool *bridgeStreamTool, status, arguments string) map[string]any {
+	itemType, name, namespace, input := emitter.aliases.applyToolAlias(tool.Name, arguments)
+	if tool.Custom {
+		itemType, name, input = "custom_tool_call", tool.Name, customToolInputFromArguments(arguments)
+	}
+	item := map[string]any{
+		"id":      tool.ItemID,
+		"type":    itemType,
+		"status":  status,
+		"call_id": tool.ID,
+		"name":    name,
+	}
+	if itemType == "custom_tool_call" {
+		item["input"] = input
+	} else {
+		item["arguments"] = arguments
+	}
+	if namespace != "" {
+		item["namespace"] = namespace
+	}
+	return item
+}
+
+// finishCustomTool emits the free-form input frames Codex expects for a custom
+// tool call: one input-delta (when non-empty), an input-done frame carrying the
+// full text, and the completed item.
+func (emitter *bridgeStreamEmitter) finishCustomTool(tool *bridgeStreamTool, arguments string) error {
+	input := customToolInputFromArguments(arguments)
+	if input != "" {
+		if err := emitter.sse("response.custom_tool_call_input.delta", map[string]any{"type": "response.custom_tool_call_input.delta", "delta": input, "item_id": tool.ItemID, "output_index": tool.Index, "sequence_number": emitter.nextSequence()}); err != nil {
+			return err
+		}
+	}
+	if err := emitter.sse("response.custom_tool_call_input.done", map[string]any{"type": "response.custom_tool_call_input.done", "input": input, "item_id": tool.ItemID, "output_index": tool.Index, "sequence_number": emitter.nextSequence()}); err != nil {
+		return err
+	}
+	item := emitter.responsesToolItem(tool, "completed", arguments)
+	return emitter.sse("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": tool.Index, "item": item, "sequence_number": emitter.nextSequence()})
 }
 
 func (emitter *bridgeStreamEmitter) chatChunk(delta map[string]any, finish any) error {

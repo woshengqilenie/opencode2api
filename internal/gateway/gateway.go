@@ -199,6 +199,13 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			return
 		}
 		bodies, err := g.prepareRouteBodies(external, route, payload)
+		// Responses clients (Codex and friends) declare namespaced and custom
+		// tools; the alias table lets the response side hand calls back in the
+		// shapes that client declared.
+		var toolAliases *wire.ToolAliases
+		if external == wire.Responses {
+			toolAliases = wire.BuildResponsesAliases(payload)
+		}
 		if err != nil {
 			wire.WriteError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
 			return
@@ -273,7 +280,7 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			if external == upstreamRoute.Protocol {
 				usage, usageReported, err = wire.ForwardStream(r.Context(), keeper, body, upstreamRoute.Protocol, model)
 			} else {
-				usage, usageReported, err = wire.TranscodeStream(r.Context(), keeper, body, upstreamRoute.Protocol, external, model)
+				usage, usageReported, err = wire.TranscodeStreamWithAliases(r.Context(), keeper, body, upstreamRoute.Protocol, external, model, toolAliases)
 			}
 			if meta != nil {
 				meta.Usage, meta.UsageReported = usage, usageReported
@@ -294,7 +301,7 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			}
 			return
 		}
-		responseBody, readErr, collapseErr := g.readNonStreamBody(resp, upstreamRoute, meta, model, g.catalog.IsFreeModel(upstreamRoute.ID))
+		responseBody, readErr, collapseErr := g.readNonStreamBody(resp, upstreamRoute, meta, model, g.catalog.IsFreeModel(upstreamRoute.ID), toolAliases)
 		// Hardening: replay a zero-output document on another node while
 		// nothing has been written downstream yet.
 		for replay := 0; readErr == nil && collapseErr == nil && replay < g.cfg.Hardening.ZeroOutputRetries &&
@@ -313,7 +320,7 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			}
 			g.logger.Info("replaying a zero-output upstream response", "component", "upstream", "event", "zero_output_replay", "request_id", ids.Request, "model", model, "replay", replay+1)
 			resp, upstreamRoute = retryResp, retryRoute
-			responseBody, readErr, collapseErr = g.readNonStreamBody(resp, upstreamRoute, meta, model, g.catalog.IsFreeModel(upstreamRoute.ID))
+			responseBody, readErr, collapseErr = g.readNonStreamBody(resp, upstreamRoute, meta, model, g.catalog.IsFreeModel(upstreamRoute.ID), toolAliases)
 		}
 		_ = resp.Body.Close()
 		if readErr != nil {
@@ -329,7 +336,7 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			meta.Usage, meta.UsageReported = usage, reported
 		}
 		if external != upstreamRoute.Protocol {
-			responseBody, err = wire.ConvertResponse(upstreamRoute.Protocol, external, responseBody)
+			responseBody, err = wire.ConvertResponseWithAliases(upstreamRoute.Protocol, external, responseBody, toolAliases)
 			if err != nil {
 				g.logger.Warn("response protocol conversion failed", "component", "conversion", "event", "response_conversion_failed", "request_id", ids.Request, "model", model, "source_protocol", upstreamRoute.Protocol, "target_protocol", external, "error", err)
 				wire.WriteError(w, external, http.StatusBadGateway, "unsupported upstream response", "upstream_error", ids.Request)
@@ -530,7 +537,7 @@ func copyErrorResponse(w http.ResponseWriter, protocol wire.Protocol, resp *http
 // status semantics. The shaped flag must not depend on telemetry alone: a free
 // model on a key lane is force-streamed whether or not request metadata exists,
 // so the catalog predicate is passed in as well.
-func (g *Gateway) readNonStreamBody(resp *http.Response, upstreamRoute models.Route, meta *telemetry.RequestMeta, model string, freeModel bool) ([]byte, error, error) {
+func (g *Gateway) readNonStreamBody(resp *http.Response, upstreamRoute models.Route, meta *telemetry.RequestMeta, model string, freeModel bool, aliases *wire.ToolAliases) ([]byte, error, error) {
 	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 	if err != nil {
 		return nil, err, nil
@@ -540,7 +547,7 @@ func (g *Gateway) readNonStreamBody(resp *http.Response, upstreamRoute models.Ro
 		// lane; collapse the same way. The anonymous lane is served streaming
 		// (see prepareAnonymousBody); collapse the events back into the single
 		// document this non-streaming client asked for.
-		collapsed, cerr := wire.CollapseStream(bytes.NewReader(responseBody), upstreamRoute.Protocol, model)
+		collapsed, cerr := wire.CollapseStreamWithAliases(bytes.NewReader(responseBody), upstreamRoute.Protocol, model, aliases)
 		if cerr != nil {
 			return responseBody, nil, cerr
 		}

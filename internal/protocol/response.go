@@ -10,7 +10,16 @@ import (
 	"opencode2api/internal/jsonutil"
 )
 
+// ConvertResponse translates a complete non-streaming response between
+// protocols. Tool aliases may be nil; pass the table from BuildResponsesAliases
+// when the target protocol is Responses so namespaced and custom tools keep
+// the item shapes the client declared.
 func ConvertResponse(from, to Protocol, body []byte) ([]byte, error) {
+	return ConvertResponseWithAliases(from, to, body, nil)
+}
+
+// ConvertResponseWithAliases is ConvertResponse with a tool alias table.
+func ConvertResponseWithAliases(from, to Protocol, body []byte, aliases *ToolAliases) ([]byte, error) {
 	if from == to {
 		return append([]byte(nil), body...), nil
 	}
@@ -25,7 +34,7 @@ func ConvertResponse(from, to Protocol, body []byte) ([]byte, error) {
 	if response.Error != "" || response.Stop == "error" {
 		return nil, fmt.Errorf("upstream response failed: %s", jsonutil.FirstString(response.Error, "upstream response failed"))
 	}
-	return json.Marshal(encodeBridgeResponse(to, response))
+	return json.Marshal(encodeBridgeResponse(to, response, aliases))
 }
 
 func decodeBridgeResponse(protocol Protocol, input map[string]any) (bridgeResponse, error) {
@@ -140,7 +149,7 @@ func decodeBridgeResponse(protocol Protocol, input map[string]any) (bridgeRespon
 	return response, nil
 }
 
-func encodeBridgeResponse(protocol Protocol, response bridgeResponse) map[string]any {
+func encodeBridgeResponse(protocol Protocol, response bridgeResponse, aliases *ToolAliases) map[string]any {
 	if response.ID == "" {
 		response.ID = identity.RandomID("resp", 12)
 	}
@@ -210,14 +219,25 @@ func encodeBridgeResponse(protocol Protocol, response bridgeResponse) map[string
 			})
 		}
 		for _, tool := range response.Tools {
-			output = append(output, map[string]any{
-				"id":        identity.RandomID("fc", 12),
-				"type":      "function_call",
-				"status":    "completed",
-				"call_id":   tool.ID,
-				"name":      tool.Name,
-				"arguments": bridgeArgumentsJSON(tool),
-			})
+			arguments := bridgeArgumentsJSON(tool)
+			itemType, name, namespace, input := aliases.applyToolAlias(tool.Name, arguments)
+			item := map[string]any{
+				"id":      identity.RandomID("fc", 12),
+				"type":    itemType,
+				"status":  "completed",
+				"call_id": tool.ID,
+				"name":    name,
+			}
+			if itemType == "custom_tool_call" {
+				item["input"] = input
+			} else {
+				item["arguments"] = arguments
+			}
+			if namespace != "" {
+				// Codex matches namespaced calls by the namespace field.
+				item["namespace"] = namespace
+			}
+			output = append(output, item)
 		}
 		status := "completed"
 		var incomplete any

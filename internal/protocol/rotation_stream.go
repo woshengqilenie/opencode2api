@@ -28,7 +28,7 @@ func RotationStream(ctx context.Context, w http.ResponseWriter, reader io.Reader
 		return usage, false, false, fmt.Errorf("streaming is unsupported")
 	}
 	parser := newStreamUsageObserver(from).parser
-	emitter := newBridgeStreamEmitter(w, flusher, to, alias)
+	emitter := newBridgeStreamEmitter(w, flusher, to, alias, nil)
 	pending := []bridgeStreamEvent{}
 	var upstreamFailure error
 	emit := func(event bridgeStreamEvent) error {

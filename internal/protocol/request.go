@@ -413,7 +413,11 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest
 		for i, raw := range jsonutil.SliceAt(input, "tools") {
 			tool, ok := raw.(map[string]any)
 			if !ok || jsonutil.StringAt(tool, "type") != "function" {
-				return request, fmt.Errorf("tools[%d] must be a function tool", i)
+				// Provider-side chat tools (web_search and friends) have no
+				// upstream representation here; dropping them keeps the rest
+				// of the toolset usable instead of rejecting the request.
+				_ = i
+				continue
 			}
 			function := jsonutil.MapAt(tool, "function")
 			request.Tools = append(request.Tools, bridgeTool{
@@ -458,13 +462,28 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest
 						appendBridgeBlock(&request.Messages, "assistant", block)
 					}
 				case "function_call":
+					name := jsonutil.StringAt(item, "name")
+					// Codex replays namespaced calls; the upstream saw the
+					// flattened name.
+					if namespace := jsonutil.StringAt(item, "namespace"); namespace != "" {
+						name = flattenNamespaceToolName(namespace, name)
+					}
+					appendBridgeBlock(&request.Messages, "assistant", bridgeBlock{
+						Kind:          "tool_call",
+						ID:            jsonutil.FirstString(jsonutil.StringAt(item, "call_id"), jsonutil.StringAt(item, "id")),
+						Name:          name,
+						ArgumentsJSON: jsonutil.StringAt(item, "arguments"),
+					})
+				case "custom_tool_call":
+					// A free-form custom tool call replays as the single-input
+					// function shape the chat wire carries.
 					appendBridgeBlock(&request.Messages, "assistant", bridgeBlock{
 						Kind:          "tool_call",
 						ID:            jsonutil.FirstString(jsonutil.StringAt(item, "call_id"), jsonutil.StringAt(item, "id")),
 						Name:          jsonutil.StringAt(item, "name"),
-						ArgumentsJSON: jsonutil.StringAt(item, "arguments"),
+						ArgumentsJSON: customToolArguments(jsonutil.StringAt(item, "input")),
 					})
-				case "function_call_output":
+				case "function_call_output", "custom_tool_call_output":
 					appendBridgeBlock(&request.Messages, "user", bridgeBlock{
 						Kind:   "tool_result",
 						CallID: jsonutil.StringAt(item, "call_id"),
@@ -484,24 +503,23 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest
 						request.Messages = append(request.Messages, bridgeMessage{Role: role, Blocks: blocks})
 					}
 				default:
-					return request, fmt.Errorf("input[%d] has unsupported Responses item type %q", i, jsonutil.StringAt(item, "type"))
+					// Items the chat wire cannot express (computer_call,
+					// web_search_call, tool_search_call, local_shell_call,
+					// compaction markers, ...) are skipped rather than
+					// failing the whole request: Codex sessions mix them in
+					// freely and the rest of the conversation remains useful.
+					continue
 				}
 			}
 		default:
 			return request, fmt.Errorf("input must be a string or array")
 		}
-		for i, raw := range jsonutil.SliceAt(input, "tools") {
-			tool, ok := raw.(map[string]any)
-			if !ok || jsonutil.StringAt(tool, "type") != "function" {
-				return request, fmt.Errorf("tools[%d] must be a function tool", i)
-			}
-			request.Tools = append(request.Tools, bridgeTool{
-				Name:        jsonutil.StringAt(tool, "name"),
-				Description: jsonutil.StringAt(tool, "description"),
-				Schema:      tool["parameters"],
-				Strict:      jsonutil.BoolAt(tool, "strict"),
-			})
-		}
+		// Codex declares namespaced and custom tools alongside plain
+		// functions. Conversions live in ResponsesToolsToChat; tools with no
+		// chat-completions equivalent (web_search, local_shell, tool_search)
+		// are dropped so the rest of the toolset stays usable.
+		converted, _ := ResponsesToolsToChat(input)
+		request.Tools = append(request.Tools, converted...)
 		request.ToolChoice = decodeResponsesToolChoice(input["tool_choice"])
 		request.ResponseFormat = jsonutil.MapAt(input, "text", "format")
 		request.ParallelToolCalls = input["parallel_tool_calls"]
