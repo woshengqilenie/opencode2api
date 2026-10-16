@@ -80,6 +80,17 @@
 - 实测口径（free DeepSeek）：元数据 200k，匿名通道实际接受到 **1,048,222** token（1,057,000 起被上游 400 拒绝，真实闸门 ≈ 2^20）；输出侧 `max_tokens=50000` 被接受，说明 32k 只是声明值。
 - 该字段随 `models` 配置块在 WebUI 的 `PUT /api/config` 往返中保留，但当前没有 WebUI 编辑入口，直接改 `config.json` 即可（保存即热生效）。
 
+### 8. Codex CLI 兼容（namespaced / custom 工具）
+
+真 Codex CLI 在 `/v1/responses` 上声明的工具不止 `type:"function"`：还有 `namespace`（把一组子工具打包，如 `multi_agent_v1`）、`custom`（自由格式工具，如 `apply_patch`）以及 `web_search` 这类由服务端执行的工具。原版实现要求每个工具都是 function，于是**任何真 Codex 会话在准备上游请求时就会 400**（`tools[7] must be a function tool`）。现在：
+
+- `namespace` 的工具扁平化为 `<namespace>__<tool>`（与 CC Switch 同名规则，>64 字符截断加哈希），回程在 `function_call` item 上补回 `namespace` 字段；
+- `custom` 工具转成单字符串参数函数（`{"input": "<原始文本>"}`），回程还原为 `custom_tool_call` item（含 `response.custom_tool_call_input.delta/done` 事件帧），原始定义嵌在描述里；
+- `web_search` / `tool_search` / `local_shell` 等上游表达不了的工具直接丢弃，不再让整个请求失败；
+- 历史回放（`function_call` 带 namespace、`custom_tool_call(+output)`、以及各类未知 item 类型）一律解码或跳过，不再报错。
+
+实测链路：Codex CLI → CC Switch 本地路由(15721) → 本网关(18080) → 匿名免费通道，`codex exec` 正常出词；协议回归测试见 `internal/protocol/responses_tools_test.go`。
+
 ## 可观测性
 
 新的日志事件（`component`/`event`）：
